@@ -2,12 +2,11 @@ blueprint:
   name: SOG – Plant soil moisture watering (weather + manual skip + Pushover)
   description: >
     Waters a plant at a scheduled time when soil moisture is low unless:
-      • the manual skip helper is ON,
-      • rain or freeze is predicted (OpenWeatherMap hourly),
-      • or moisture is already above a skip threshold.
+    • the manual skip helper is ON,
+    • rain or freeze is predicted (OpenWeatherMap hourly),
+    • or moisture is already above a skip threshold.
     Sends optional Pushover notifications and can publish an MQTT breadcrumb.
   domain: automation
-  # source_url: https://raw.githubusercontent.com/youruser/yourrepo/main/SOG_Main.yaml
 
   input:
 
@@ -111,15 +110,13 @@ blueprint:
           domain: input_boolean
 
     pushover_device:
-      name: Pushover device (optional)
-      description: e.g. DrewZillaS23 — leave blank to send to all
+      name: Pushover device (optional; blank = all)
       default: ''
       selector:
         text: {}
 
     mqtt_topic:
-      name: MQTT topic (optional)
-      description: e.g. outsidehose/automation — leave blank to disable
+      name: MQTT topic (optional; blank = disable)
       default: ''
       selector:
         text: {}
@@ -148,7 +145,6 @@ trigger:
     at: !input schedule_time
 
 # ---------- conditions ----------
-# Optional even-day gate
 condition:
   - condition: template
     value_template: >
@@ -161,7 +157,7 @@ condition:
 # ---------- actions ----------
 action:
 
-  # 1) Manual skip: if helper is ON, turn it OFF, notify, publish MQTT, stop.
+  # 1) Manual skip flow
   - choose:
       - conditions:
           - condition: state
@@ -205,7 +201,7 @@ action:
       type: hourly
     response_variable: owm
 
-  # 3) Build forecast windows and read moisture
+  # 3) Build windows + read moisture
   - variables:
       fc: "{{ (owm[owm_entity].forecast if owm and owm.get(owm_entity) else []) }}"
       start: "{{ now().isoformat() }}"
@@ -224,10 +220,10 @@ action:
               | list }}
       moist: "{{ states(moisture_entity) | float(0) }}"
 
-  # 4) Decide: water vs skip (weather/wet)
+  # 4) Decide
   - choose:
 
-      # ---- Water: moisture is low and no rain/freeze expected ----
+      # Water: low moisture and clear weather
       - conditions:
           - condition: template
             value_template: >
@@ -244,8 +240,9 @@ action:
                     data:
                       title: "{{ plant_name }}: watering"
                       message: >
-                        Soil {{ '%.0f'|format(moist) }}%. No rain ≥{{ rain_threshold }}% next {{ rain_hours }}h
-                        and no freeze ≤{{ freeze_temp_f }}°F next {{ freeze_hours }}h (OWM).
+                        Soil {{ '%.0f'|format(moist) }}%. No rain ≥{{ rain_threshold }}% next
+                        {{ rain_hours }}h and no freeze ≤{{ freeze_temp_f }}°F next
+                        {{ freeze_hours }}h (OWM).
                       data:
                         device: "{{ pushover_device }}"
             default:
@@ -253,8 +250,9 @@ action:
                 data:
                   title: "{{ plant_name }}: watering"
                   message: >
-                    Soil {{ '%.0f'|format(moist) }}%. No rain ≥{{ rain_threshold }}% next {{ rain_hours }}h
-                    and no freeze ≤{{ freeze_temp_f }}°F next {{ freeze_hours }}h (OWM).
+                    Soil {{ '%.0f'|format(moist) }}%. No rain ≥{{ rain_threshold }}% next
+                    {{ rain_hours }}h and no freeze ≤{{ freeze_temp_f }}°F next
+                    {{ freeze_hours }}h (OWM).
 
           - choose:
               - conditions: "{{ mqtt_topic|length > 0 }}"
@@ -266,10 +264,9 @@ action:
                         {{ {'event':'water','plant':plant_name,'moisture':moist,
                             'time':now().isoformat()} | tojson }}
 
-      # ---- Skip: weather or already wet ----
+      # Skip (wet or guarded by weather)
       - conditions: []
         sequence:
-
           - variables:
               r: "{{ rainy|first if rainy|length>0 else none }}"
               f: "{{ freezing|first if freezing|length>0 else none }}"
