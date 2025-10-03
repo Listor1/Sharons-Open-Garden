@@ -1,0 +1,331 @@
+blueprint:
+  name: Plant – Soil moisture watering (weather + manual skip + Pushover)
+  description: >
+    Waters a plant at a scheduled time when soil moisture is low, unless:
+    • a manual skip helper is ON,
+    • rain or freeze is predicted (OpenWeatherMap hourly),
+    • moisture is already above a skip threshold.
+    Sends optional Pushover notifications and can publish an MQTT breadcrumb.
+
+    Create one automation per plant (Basil, Hibiscus, Hydrangea…).
+  domain: automation
+  input:
+    plant_name:
+      name: Plant name (for messages)
+      selector: text
+      default: Plant
+    moisture_sensor:
+      name: Soil moisture sensor
+      selector:
+        entity:
+          domain: sensor
+    water_below:
+      name: Water when moisture ≤
+      description: Percent at/below which watering should start (conservative).
+      default: 45
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: '%'
+          mode: slider
+    skip_above:
+      name: Skip when moisture ≥
+      description: Percent at/above which watering is skipped.
+      default: 60
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: '%'
+          mode: slider
+    watering_script:
+      name: Script to run when watering
+      selector:
+        entity:
+          domain: script
+    schedule_time:
+      name: Time to evaluate / water
+      selector: time
+      default: '04:00:00'
+    even_days_only:
+      name: Only run on even days
+      selector: boolean
+      default: true
+    skip_helper:
+      name: Manual skip helper (optional)
+      description: If ON at run time, the run is skipped and the helper is reset to OFF.
+      default:
+      selector:
+        entity:
+          domain: input_boolean
+          multiple: false
+          include:
+            - input_boolean
+    owm_entity:
+      name: OpenWeatherMap weather entity (optional)
+      description: Leave empty to ignore weather checks
+      default:
+      selector:
+        entity:
+          domain: weather
+          multiple: false
+    rain_threshold:
+      name: Rain probability ≥ (skip)
+      default: 45
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: '%'
+          mode: slider
+    rain_hours:
+      name: Look-ahead hours for rain
+      default: 12
+      selector:
+        number:
+          min: 1
+          max: 48
+          step: 1
+    freeze_temp_f:
+      name: Freeze temp (°F) or below (skip)
+      default: 36
+      selector:
+        number:
+          min: -40
+          max: 60
+          step: 1
+    freeze_hours:
+      name: Look-ahead hours for freeze
+      default: 24
+      selector:
+        number:
+          min: 1
+          max: 72
+          step: 1
+    notify_service:
+      name: Pushover notify service (optional)
+      description: Usually notify.pushover (leave blank to disable notifications)
+      default: notify.pushover
+      selector:
+        text:
+    pushover_device:
+      name: Pushover device (optional)
+      description: e.g. DrewZillaS23 (leave blank to notify all devices on account)
+      default: ''
+      selector:
+        text
+    mqtt_topic:
+      name: MQTT topic (optional)
+      description: Leave blank to disable MQTT breadcrumbs
+      default: outsidehose/automation
+      selector:
+        text
+
+mode: single
+max_exceeded: silent
+
+variables:
+  plant_name: !input plant_name
+  moisture_sensor: !input moisture_sensor
+  water_below: !input water_below
+  skip_above: !input skip_above
+  skip_helper: !input skip_helper
+  owm_entity: !input owm_entity
+  rain_threshold: !input rain_threshold
+  rain_hours: !input rain_hours
+  freeze_temp_f: !input freeze_temp_f
+  freeze_hours: !input freeze_hours
+  notify_service: !input notify_service
+  pushover_device: !input pushover_device
+  mqtt_topic: !input mqtt_topic
+
+triggers:
+  - platform: time
+    at: !input schedule_time
+
+conditions:
+  - condition: or
+    conditions:
+      - condition: template
+        value_template: "{{ not ( !input even_days_only ) }}"
+      - condition: template
+        value_template: "{{ now().day % 2 == 0 }}"
+
+actions:
+  # Pull current values & weather (if provided)
+  - variables:
+      moist: "{{ states(moisture_sensor) | float(0) }}"
+      even_day: "{{ now().day % 2 == 0 }}"
+  - choose:
+      # Manual skip helper ON?
+      - conditions:
+          - condition: template
+            value_template: "{{ skip_helper is not none and is_state(skip_helper, 'on') }}"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ skip_helper is not none }}"
+            then:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: "{{ skip_helper }}"
+          - if:
+              - condition: template
+                value_template: "{{ notify_service | length > 0 }}"
+            then:
+              - service: "{{ notify_service }}"
+                data:
+                  title: "{{ plant_name }} – skipped (manual)"
+                  message: "Manual skip helper was ON. Resetting to OFF."
+                  data:
+                    device: "{{ pushover_device }}"
+          - if:
+              - condition: template
+                value_template: "{{ mqtt_topic | length > 0 }}"
+            then:
+              - service: mqtt.publish
+                data:
+                  topic: "{{ mqtt_topic }}"
+                  payload: >
+                    {{ {"event":"skip_manual","plant":plant_name,"time":now().isoformat()} | tojson }}
+          - stop: Manual skip active — aborting.
+
+  # Get weather forecast if an entity was provided
+  - if:
+      - condition: template
+        value_template: "{{ owm_entity is not none and owm_entity | string | length > 0 }}"
+    then:
+      - action: weather.get_forecasts
+        target:
+          entity_id: "{{ owm_entity }}"
+        data:
+          type: hourly
+        response_variable: owm
+      - variables:
+          fc: "{{ owm[owm_entity].forecast if owm and owm.get(owm_entity) else [] }}"
+          start: "{{ now().isoformat() }}"
+          rain_end: "{{ (now() + timedelta(hours=rain_hours)).isoformat() }}"
+          freeze_end: "{{ (now() + timedelta(hours=freeze_hours)).isoformat() }}"
+          rainy: >-
+            {{ fc
+               | selectattr('datetime','>=', start)
+               | selectattr('datetime','<=', rain_end)
+               | selectattr('precipitation_probability','defined')
+               | selectattr('precipitation_probability','>=', rain_threshold)
+               | list }}
+          freezing: >-
+            {{ fc
+               | selectattr('datetime','>=', start)
+               | selectattr('datetime','<=', freeze_end)
+               | selectattr('temperature','<=', freeze_temp_f)
+               | list }}
+    else:
+      - variables:
+          rainy: []
+          freezing: []
+
+  # Decide
+  - variables:
+      moisture_skip: "{{ moist >= skip_above }}"
+      moisture_low: "{{ moist <= water_below }}"
+      weather_block: "{{ (rainy | length > 0) or (freezing | length > 0) }}"
+  - choose:
+      # Skip because already wet or weather block
+      - conditions:
+          - condition: or
+            conditions:
+              - condition: template
+                value_template: "{{ moisture_skip }}"
+              - condition: template
+                value_template: "{{ weather_block }}"
+        sequence:
+          - service: persistent_notification.create
+            data:
+              title: "{{ plant_name }} – skipped"
+              message: >-
+                {% set reasons = [] -%}
+                {% if moisture_skip %}{% set _ = reasons.append('soil ≥ ' ~ skip_above ~ '% (' ~ moist|round(0) ~ '%)') %}{% endif -%}
+                {% if rainy|length>0 %}{% set _ = reasons.append('rain ≥' ~ rain_threshold ~ '% by ' ~ (as_local(as_datetime((rainy|first).datetime)))) %}{% endif -%}
+                {% if freezing|length>0 %}{% set _ = reasons.append('freeze ≤' ~ freeze_temp_f ~ '°F by ' ~ (as_local(as_datetime((freezing|first).datetime)))) %}{% endif -%}
+                Skipped watering: {{ reasons|join('; ') }}.
+          - if:
+              - condition: template
+                value_template: "{{ notify_service | length > 0 }}"
+            then:
+              - service: "{{ notify_service }}"
+                data:
+                  title: "{{ plant_name }} – skipped"
+                  message: >-
+                    Soil {{ moist|round(0) }}%. {% if moisture_skip %}Already ≥ {{ skip_above }}%. {% endif %}
+                    {% if rainy|length>0 %}Rain ≥{{ rain_threshold }}% expected by {{ as_local(as_datetime((rainy|first).datetime)) }}. {% endif %}
+                    {% if freezing|length>0 %}Freeze ≤{{ freeze_temp_f }}°F expected by {{ as_local(as_datetime((freezing|first).datetime)) }}. {% endif %}
+                  data:
+                    device: "{{ pushover_device }}"
+          - if:
+              - condition: template
+                value_template: "{{ mqtt_topic | length > 0 }}"
+            then:
+              - service: mqtt.publish
+                data:
+                  topic: "{{ mqtt_topic }}"
+                  payload: >
+                    {{ {
+                      "event":"skip",
+                      "plant": plant_name,
+                      "moisture": moist|round(1),
+                      "reason": ( moisture_skip and "moisture_high" ) or
+                                ( (rainy|length>0) and "rain" ) or
+                                ( (freezing|length>0) and "freeze" ) or "unknown",
+                      "time": now().isoformat()
+                    } | tojson }}
+
+      # Water
+      - conditions:
+          - condition: template
+            value_template: "{{ moisture_low and not weather_block }}"
+        sequence:
+          - service: script.turn_on
+            target:
+              entity_id: !input watering_script
+          - service: persistent_notification.create
+            data:
+              title: "{{ plant_name }} – watering"
+              message: "Soil {{ moist|round(0) }}% (≤ {{ water_below }}%). No rain/freeze in look-ahead."
+          - if:
+              - condition: template
+                value_template: "{{ notify_service | length > 0 }}"
+            then:
+              - service: "{{ notify_service }}"
+                data:
+                  title: "{{ plant_name }} – watering"
+                  message: "Soil {{ moist|round(0) }}% (≤ {{ water_below }}%). No rain/freeze in look-ahead."
+                  data:
+                    device: "{{ pushover_device }}"
+          - if:
+              - condition: template
+                value_template: "{{ mqtt_topic | length > 0 }}"
+            then:
+              - service: mqtt.publish
+                data:
+                  topic: "{{ mqtt_topic }}"
+                  payload: >
+                    {{ {"event":"water","plant":plant_name,"moisture":moist|round(1),"time":now().isoformat()} | tojson }}
+
+      # Between thresholds → conservative skip
+      - conditions: []
+        sequence:
+          - service: persistent_notification.create
+            data:
+              title: "{{ plant_name }} – skipped (in-between)"
+              message: "Soil {{ moist|round(0) }}%. Between {{ water_below }}% and {{ skip_above }}% (conservative hold)."
+          - if:
+              - condition: template
+                value_template: "{{ notify_service | length > 0 }}"
+            then:
+              - service: "{{ notify_service }}"
+                data:
+                  title: "{{ plant_name }} – skipped (in-between)"
+                  message: "Soil {{ moist|round(0) }}%. Between {{ water_below }}% and {{ skip_above }}%."
+                  data:
+                    device: "{{ pushover_device }}"
