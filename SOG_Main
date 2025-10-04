@@ -1,10 +1,11 @@
 blueprint:
-  name: SOG – Plant soil moisture watering (weather + manual skip + Pushover)
+  name: SOG – Plant soil moisture watering (weather + manual skip + Pushover + frost-occurred)
   description: >
     Waters a plant at a scheduled time when soil moisture is low unless:
     • the manual skip helper is ON,
     • rain or freeze is predicted (OpenWeatherMap hourly),
-    • or moisture is already above a skip threshold.
+    • moisture is already above a skip threshold, or
+    • a recent frost occurred (optional).
     Sends optional Pushover notifications and can publish an MQTT breadcrumb.
   domain: automation
 
@@ -109,6 +110,30 @@ blueprint:
         entity:
           domain: input_boolean
 
+    # -------- Frost-Occurred (optional) --------
+    frost_occurred:
+      name: Frost occurred flag (optional, input_boolean)
+      description: "Entity ID of the boolean that your frost automation turns ON (blank = ignore)."
+      default: ''
+      selector:
+        text: {}
+
+    frost_time:
+      name: Frost occurred time (optional, input_datetime)
+      description: "Entity ID storing the datetime of the frost event (blank = treat flag alone as recent)."
+      default: ''
+      selector:
+        text: {}
+
+    frost_skip_hours:
+      name: Skip watering for this many hours after frost
+      default: 12
+      selector:
+        number:
+          min: 1
+          max: 48
+
+    # -------- Notifications / breadcrumbs --------
     pushover_device:
       name: Pushover device (optional; blank = all)
       default: ''
@@ -138,6 +163,9 @@ variables:
   skip_helper: !input skip_helper
   pushover_device: !input pushover_device
   mqtt_topic: !input mqtt_topic
+  frost_flag: !input frost_occurred           # text of entity_id or ''
+  frost_time: !input frost_time               # text of entity_id or ''
+  frost_skip_hours: !input frost_skip_hours
 
 # ---------- trigger ----------
 trigger:
@@ -193,7 +221,57 @@ action:
                         {{ {'event':'skip_manual','plant':plant_name,'time':now().isoformat()} | tojson }}
           - stop: Manual skip active — aborting.
 
-  # 2) Get OWM hourly forecast
+  # 2) Frost-occurred skip (optional)
+  - variables:
+      recent_frost: >-
+        {# If no entity provided, it's false #}
+        {% set f = frost_flag %}
+        {% if not f or f|length == 0 %}
+          false
+        {% else %}
+          {% set on = is_state(f, 'on') %}
+          {% set t_id = frost_time %}
+          {% if not on %}
+            false
+          {% elif t_id and t_id|length > 0 and states(t_id) not in ['unknown','unavailable',''] %}
+            {% set t = as_datetime(states(t_id)) %}
+            {{ (now() - t) <= timedelta(hours=frost_skip_hours|int) }}
+          {% else %}
+            true
+          {% endif %}
+        {% endif %}
+
+  - choose:
+      - conditions: "{{ recent_frost }}"
+        sequence:
+          - choose:
+              - conditions: "{{ pushover_device|length > 0 }}"
+                sequence:
+                  - service: notify.pushover
+                    data:
+                      title: "{{ plant_name }}: skipped (recent frost)"
+                      message: >
+                        Skipping for {{ frost_skip_hours }}h after frost event.
+                        (Flag: {{ frost_flag if frost_flag|length>0 else 'n/a' }})
+                      data:
+                        device: "{{ pushover_device }}"
+            default:
+              - service: notify.pushover
+                data:
+                  title: "{{ plant_name }}: skipped (recent frost)"
+                  message: "Skipping for {{ frost_skip_hours }}h after frost event."
+
+          - choose:
+              - conditions: "{{ mqtt_topic|length > 0 }}"
+                sequence:
+                  - service: mqtt.publish
+                    data:
+                      topic: "{{ mqtt_topic }}"
+                      payload: >
+                        {{ {'event':'skip_frost','plant':plant_name,'time':now().isoformat()} | tojson }}
+          - stop: Recent frost — aborting.
+
+  # 3) Get OWM hourly forecast
   - service: weather.get_forecasts
     target:
       entity_id: !input owm_entity
@@ -201,7 +279,7 @@ action:
       type: hourly
     response_variable: owm
 
-  # 3) Build windows + read moisture
+  # 4) Build windows + read moisture
   - variables:
       fc: "{{ (owm[owm_entity].forecast if owm and owm.get(owm_entity) else []) }}"
       start: "{{ now().isoformat() }}"
@@ -220,7 +298,7 @@ action:
               | list }}
       moist: "{{ states(moisture_entity) | float(0) }}"
 
-  # 4) Decide
+  # 5) Decide
   - choose:
 
       # Water: low moisture and clear weather
@@ -270,16 +348,6 @@ action:
           - variables:
               r: "{{ rainy|first if rainy|length>0 else none }}"
               f: "{{ freezing|first if freezing|length>0 else none }}"
-              reason: >
-                {%- if moist >= skip_above -%}
-                  already_wet ({{ '%.0f'|format(moist) }}%)
-                {%- elif r is not none -%}
-                  rain_soon ({{ r.precipitation_probability }}% at {{ as_local(as_datetime(r.datetime)) }})
-                {%- elif f is not none -%}
-                  freeze_soon ({{ f.temperature }}°F at {{ as_local(as_datetime(f.datetime)) }})
-                {%- else -%}
-                  guarded
-                {%- endif -%}
 
           - choose:
               - conditions: "{{ pushover_device|length > 0 }}"
@@ -328,6 +396,10 @@ action:
                       topic: "{{ mqtt_topic }}"
                       payload: >
                         {{ {'event':'skip','plant':plant_name,'moisture':moist,
-                            'reason':reason,'time':now().isoformat()} | tojson }}
+                            'reason': ( 'already_wet' if moist >= skip_above
+                                       else 'rain_soon' if r is not none
+                                       else 'freeze_soon' if f is not none
+                                       else 'guarded'),
+                            'time':now().isoformat()} | tojson }}
 
 mode: single
