@@ -1,11 +1,12 @@
 blueprint:
-  name: SOG – Plant soil moisture watering (weather + manual skip + Pushover + frost-occurred)
+  name: SOG – Plant soil moisture watering (weather + manual skip + Pushover + frost + root-rot guard)
   description: >
     Waters a plant at a scheduled time when soil moisture is low unless:
     • the manual skip helper is ON,
     • rain or freeze is predicted (OpenWeatherMap hourly),
-    • moisture is already above a skip threshold, or
-    • a recent frost occurred (optional).
+    • moisture is already above a skip threshold,
+    • a recent frost occurred (optional), or
+    • the root-rot guard is active (optional: wet-hours and/or drying-rate).
     Sends optional Pushover notifications and can publish an MQTT breadcrumb.
   domain: automation
 
@@ -113,7 +114,7 @@ blueprint:
     # -------- Frost-Occurred (optional) --------
     frost_occurred:
       name: Frost occurred flag (optional, input_boolean)
-      description: "Entity ID of the boolean that your frost automation turns ON (blank = ignore)."
+      description: "Entity ID of the boolean your frost automation turns ON (blank = ignore)."
       default: ''
       selector:
         text: {}
@@ -132,6 +133,52 @@ blueprint:
         number:
           min: 1
           max: 48
+
+    # -------- Root-rot guard (optional) --------
+    wet_guard_percent:
+      name: Root-rot guard – “wet” if moisture ≥
+      description: Used by drying-rate guard; also recommended for your wet/binary sensor.
+      default: 65
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: '%'
+          mode: slider
+
+    wet_hours_sensor:
+      name: Wet-hours sensor (history_stats) – optional
+      description: Select a sensor that reports total “wet” hours in a recent window (e.g., last 18–24h).
+      selector:
+        entity:
+          domain: sensor
+
+    wet_guard_hours:
+      name: Root-rot guard – max wet hours in lookback (if sensor provided)
+      default: 12
+      selector:
+        number:
+          min: 1
+          max: 48
+
+    rate_sensor:
+      name: Drying-rate sensor (derivative %/h) – optional
+      description: A derivative of your soil sensor in % per hour (negative values mean drying).
+      selector:
+        entity:
+          domain: sensor
+
+    min_drying_rate:
+      name: Root-rot guard – minimum drying rate (%/h)
+      description: If moisture ≥ “wet” and rate is above (>-X) we treat it as “not drying”.
+      default: 0.2
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.1
+          unit_of_measurement: '%/h'
+          mode: slider
 
     # -------- Notifications / breadcrumbs --------
     pushover_device:
@@ -163,9 +210,16 @@ variables:
   skip_helper: !input skip_helper
   pushover_device: !input pushover_device
   mqtt_topic: !input mqtt_topic
-  frost_flag: !input frost_occurred           # text of entity_id or ''
-  frost_time: !input frost_time               # text of entity_id or ''
+
+  frost_flag: !input frost_occurred
+  frost_time: !input frost_time
   frost_skip_hours: !input frost_skip_hours
+
+  wet_guard_percent: !input wet_guard_percent
+  wet_hours_sensor: !input wet_hours_sensor
+  wet_guard_hours: !input wet_guard_hours
+  rate_sensor: !input rate_sensor
+  min_drying_rate: !input min_drying_rate
 
 # ---------- trigger ----------
 trigger:
@@ -203,8 +257,7 @@ action:
                     data:
                       title: "{{ plant_name }}: skipped (manual)"
                       message: "Manual skip helper was ON. Skipping once and resetting it to OFF."
-                      data:
-                        device: "{{ pushover_device }}"
+                      data: { device: "{{ pushover_device }}" }
             default:
               - service: notify.pushover
                 data:
@@ -224,7 +277,6 @@ action:
   # 2) Frost-occurred skip (optional)
   - variables:
       recent_frost: >-
-        {# If no entity provided, it's false #}
         {% set f = frost_flag %}
         {% if not f or f|length == 0 %}
           false
@@ -252,15 +304,12 @@ action:
                       title: "{{ plant_name }}: skipped (recent frost)"
                       message: >
                         Skipping for {{ frost_skip_hours }}h after frost event.
-                        (Flag: {{ frost_flag if frost_flag|length>0 else 'n/a' }})
-                      data:
-                        device: "{{ pushover_device }}"
+                      data: { device: "{{ pushover_device }}" }
             default:
               - service: notify.pushover
                 data:
                   title: "{{ plant_name }}: skipped (recent frost)"
                   message: "Skipping for {{ frost_skip_hours }}h after frost event."
-
           - choose:
               - conditions: "{{ mqtt_topic|length > 0 }}"
                 sequence:
@@ -271,7 +320,63 @@ action:
                         {{ {'event':'skip_frost','plant':plant_name,'time':now().isoformat()} | tojson }}
           - stop: Recent frost — aborting.
 
-  # 3) Get OWM hourly forecast
+  # 3) Root-rot guard (optional: wet-hours and/or drying-rate)
+  - variables:
+      moist: "{{ states(moisture_entity) | float(0) }}"
+      hrs: >-
+        {% if wet_hours_sensor is defined and wet_hours_sensor %}
+          {{ states(wet_hours_sensor) | float(0) }}
+        {% else %} 0 {% endif %}
+      stuck_wet_hours: >-
+        {% if wet_hours_sensor is defined and wet_hours_sensor %}
+          {{ hrs > (wet_guard_hours | float(12)) }}
+        {% else %} false {% endif %}
+      rate: >-
+        {% if rate_sensor is defined and rate_sensor %}
+          {{ states(rate_sensor) | float(0) }}
+        {% else %} 0 {% endif %}
+      stuck_rate: >-
+        {% if rate_sensor is defined and rate_sensor %}
+          {{ (moist >= wet_guard_percent | float(65)) and (rate > -(min_drying_rate | float(0.2))) }}
+        {% else %} false {% endif %}
+      root_guard: "{{ stuck_wet_hours or stuck_rate }}"
+
+  - choose:
+      - conditions: "{{ root_guard }}"
+        sequence:
+          - variables:
+              reason: >-
+                {% if stuck_wet_hours %}wet_hours>{% endif %}
+                {% if stuck_rate %}{{ ' ' if stuck_wet_hours else '' }}no_drying{% endif %}
+          - choose:
+              - conditions: "{{ pushover_device|length > 0 }}"
+                sequence:
+                  - service: notify.pushover
+                    data:
+                      title: "{{ plant_name }}: skipped (root-rot guard)"
+                      message: >
+                        Moisture {{ '%.0f'|format(moist) }}%. Guard reason: {{ reason|trim }}.
+                        Check drainage/mix; skipping to avoid waterlogging.
+                      data: { device: "{{ pushover_device }}" }
+            default:
+              - service: notify.pushover
+                data:
+                  title: "{{ plant_name }}: skipped (root-rot guard)"
+                  message: >
+                    Moisture {{ '%.0f'|format(moist) }}%. Guard reason: {{ reason|trim }}.
+                    Check drainage/mix; skipping to avoid waterlogging.
+          - choose:
+              - conditions: "{{ mqtt_topic|length > 0 }}"
+                sequence:
+                  - service: mqtt.publish
+                    data:
+                      topic: "{{ mqtt_topic }}"
+                      payload: >
+                        {{ {'event':'skip_root_guard','plant':plant_name,'moisture':moist,
+                            'hours':hrs,'rate':rate,'time':now().isoformat()} | tojson }}
+          - stop: Root-rot guard active — aborting.
+
+  # 4) Get OWM hourly forecast
   - service: weather.get_forecasts
     target:
       entity_id: !input owm_entity
@@ -279,7 +384,7 @@ action:
       type: hourly
     response_variable: owm
 
-  # 4) Build windows + read moisture
+  # 5) Build windows + read moisture (moist already set)
   - variables:
       fc: "{{ (owm[owm_entity].forecast if owm and owm.get(owm_entity) else []) }}"
       start: "{{ now().isoformat() }}"
@@ -296,11 +401,9 @@ action:
               | selectattr('datetime','<=', freeze_end)
               | selectattr('temperature','<=', freeze_temp_f)
               | list }}
-      moist: "{{ states(moisture_entity) | float(0) }}"
 
-  # 5) Decide
+  # 6) Decide
   - choose:
-
       # Water: low moisture and clear weather
       - conditions:
           - condition: template
@@ -310,7 +413,6 @@ action:
           - service: script.turn_on
             target:
               entity_id: !input water_script
-
           - choose:
               - conditions: "{{ pushover_device|length > 0 }}"
                 sequence:
@@ -321,8 +423,7 @@ action:
                         Soil {{ '%.0f'|format(moist) }}%. No rain ≥{{ rain_threshold }}% next
                         {{ rain_hours }}h and no freeze ≤{{ freeze_temp_f }}°F next
                         {{ freeze_hours }}h (OWM).
-                      data:
-                        device: "{{ pushover_device }}"
+                      data: { device: "{{ pushover_device }}" }
             default:
               - service: notify.pushover
                 data:
@@ -331,7 +432,6 @@ action:
                     Soil {{ '%.0f'|format(moist) }}%. No rain ≥{{ rain_threshold }}% next
                     {{ rain_hours }}h and no freeze ≤{{ freeze_temp_f }}°F next
                     {{ freeze_hours }}h (OWM).
-
           - choose:
               - conditions: "{{ mqtt_topic|length > 0 }}"
                 sequence:
@@ -348,7 +448,6 @@ action:
           - variables:
               r: "{{ rainy|first if rainy|length>0 else none }}"
               f: "{{ freezing|first if freezing|length>0 else none }}"
-
           - choose:
               - conditions: "{{ pushover_device|length > 0 }}"
                 sequence:
@@ -368,8 +467,7 @@ action:
                         {%- else -%}
                           Weather guard active.
                         {%- endif -%}
-                      data:
-                        device: "{{ pushover_device }}"
+                      data: { device: "{{ pushover_device }}" }
             default:
               - service: notify.pushover
                 data:
@@ -387,7 +485,6 @@ action:
                     {%- else -%}
                       Weather guard active.
                     {%- endif -%}
-
           - choose:
               - conditions: "{{ mqtt_topic|length > 0 }}"
                 sequence:
